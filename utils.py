@@ -72,7 +72,6 @@ def create_batch_requests(df,BATCH_SIZE = 50000,path=''):
     print(f"✅ All {total_batches} batches created successfully in JSONL format!")
 import pandas as pd
 import json
-
 def merge_response_to_df(df, response_file):
     # Load responses from JSONL file    
     responses = {}
@@ -98,10 +97,13 @@ def merge_response_to_df(df, response_file):
                 print(f"Skipping malformed line: {line[:100]}... Error: {e}")
 
     # Map extracted responses to the DataFrame
-    df_sorted["text_clean"] = df_sorted["orig_index"].map(responses)
+    df.loc[df["text_clean"].isna(), "text_clean"] = df["orig_index"].map(responses)
+
 
     # Save the updated DataFrame
     df.to_csv("updated_dataframe.csv", index=False)
 
     print("✅DataFrame updated successfully!")
-    
+
+
+
