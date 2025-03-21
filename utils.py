@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import json
 import os
+import time
 
 def create_histogram(df, column_name):
     # Create the histogram
@@ -104,6 +105,50 @@ def merge_response_to_df(df, response_file):
     df.to_csv("updated_dataframe.csv", index=False)
 
     print("✅DataFrame updated successfully!")
+
+def upload_new_batch(request_index,client):
+
+    batch_input_file = client.files.create(
+        file=open(f"batch_requests/batch_{request_index}.jsonl","rb"),
+        purpose="batch"
+    )
+    return batch_input_file
+
+def evaluate_batch(batch_input_file,client):
+    current_batch = client.batches.create(
+        input_file_id=batch_input_file.id,  # or whatever your variable name is
+        endpoint="/v1/chat/completions",
+        completion_window="24h",
+        metadata={
+            "description": "nightly eval job"
+        }
+    )
+    return current_batch  
+
+def check_status(current_batch, client):
+      current_batch = client.batches.retrieve(current_batch.id)
+      return current_batch.status
+
+def save_response_to_jsonl(current_batch,request_index,client):
+  file_response = client.files.content(current_batch.output_file_id)
+
+  #save to jsonl
+  with open(f"batch_{request_index}_output.jsonl", "wb") as f:
+      f.write(file_response.content)
+  
+
+def save_to_csv(df,path):
+  df.to_csv(os.path.join(path,"../output/cleaned.csv"), index=False)
+
+def loop_batch_clean(df,client,path,requests = [0,12]):
+    for request_index in range(requests[0],requests[1]):
+        batch_input_file = upload_new_batch(request_index,client)
+        current_batch = evaluate_batch(batch_input_file,client)
+        while check_status(current_batch,client) != "completed":
+            time.sleep(300)
+        save_response_to_jsonl(current_batch,request_index,client)
+        merge_response_to_df(df,f"batch_{request_index}_output.jsonl")
+        save_to_csv(df,path)
 
 
 
