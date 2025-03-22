@@ -4,6 +4,9 @@ import json
 import os
 import time
 
+from pydantic.type_adapter import P
+
+
 def create_histogram(df, column_name):
     # Create the histogram
     plt.hist(df[column_name], bins=100)  # you can adjust 'bins' as needed
@@ -12,13 +15,14 @@ def create_histogram(df, column_name):
     plt.title('Histogram of Text Lengths')
     plt.show()
 
-def trim(df,column, interval):
+
+def trim(df, column, interval):
     df = df[df[column] > interval[0]]
     df = df[df[column] < interval[1]]
     return df
 
 
-def create_batch_requests(df,BATCH_SIZE = 50000,path=''):
+def create_batch_requests(df, BATCH_SIZE=50000, path=''):
     # OpenAI batch limit
     total_batches = (len(df) // BATCH_SIZE) + (1 if len(df) % BATCH_SIZE != 0 else 0)
 
@@ -29,7 +33,7 @@ def create_batch_requests(df,BATCH_SIZE = 50000,path=''):
     }
     # Create output directory
     output_dir = "batch_requests"
-    path = os.path.join(path,output_dir)
+    path = os.path.join(path, output_dir)
     os.makedirs(path, exist_ok=True)
 
     # Generate batch files in JSONL format
@@ -38,8 +42,8 @@ def create_batch_requests(df,BATCH_SIZE = 50000,path=''):
         batch_end = min((batch_num + 1) * BATCH_SIZE, len(df))
         batch_df = df.iloc[batch_start:batch_end]  # subset of the DataFrame
 
-        #batch_filename = f"{output_dir}/batch_{batch_num+1}.jsonl"
-        batch_filename = os.path.join(path, f"batch_{batch_num+1}.jsonl")
+        # batch_filename = f"{output_dir}/batch_{batch_num+1}.jsonl"
+        batch_filename = os.path.join(path, f"batch_{batch_num + 1}.jsonl")
 
         with open(batch_filename, "w", encoding="utf-8") as f:
             # Iterate over rows in the current batch
@@ -50,10 +54,9 @@ def create_batch_requests(df,BATCH_SIZE = 50000,path=''):
                 custom_id = f"request-{orig_index}"  # <-- Use the df's "id" column
                 max_tokens = row["num_tokens"]  # <-- Use the df's "num_tokens" column
 
-
                 # Construct the request
                 request = {
-                    "custom_id": str(custom_id),   # convert to string just to be safe
+                    "custom_id": str(custom_id),  # convert to string just to be safe
                     "method": "POST",
                     "url": "/v1/chat/completions",
                     "body": {
@@ -68,13 +71,17 @@ def create_batch_requests(df,BATCH_SIZE = 50000,path=''):
                 # Write each JSON request object on its own line
                 f.write(json.dumps(request, ensure_ascii=False) + "\n")
 
-        print(f"Batch {batch_num+1}/{total_batches} saved: {batch_filename}")
+        print(f"Batch {batch_num + 1}/{total_batches} saved: {batch_filename}")
 
     print(f"✅ All {total_batches} batches created successfully in JSONL format!")
+
+
 import pandas as pd
 import json
+
+
 def merge_response_to_df(df, response_file):
-    # Load responses from JSONL file    
+    # Load responses from JSONL file
     responses = {}
 
     # Read and process the JSONL file
@@ -84,7 +91,7 @@ def merge_response_to_df(df, response_file):
                 data = json.loads(line.strip())  # Ensure clean JSON parsing
                 custom_id = data.get("custom_id", "")
                 orig_id = int(custom_id.split("-")[-1])  # Extract orig_index from custom_id
-                
+
                 # Extract response text safely
                 response_body = data.get("response", {}).get("body", {})
                 choices = response_body.get("choices", [])
@@ -92,7 +99,7 @@ def merge_response_to_df(df, response_file):
                     response_text = choices[0].get("message", {}).get("content", "").strip()
                 else:
                     response_text = ""  # Default to empty string if no valid response
-                
+
                 responses[orig_id] = response_text
             except json.JSONDecodeError as e:
                 print(f"Skipping malformed line: {line[:100]}... Error: {e}")
@@ -100,21 +107,22 @@ def merge_response_to_df(df, response_file):
     # Map extracted responses to the DataFrame
     df.loc[df["text_clean"].isna(), "text_clean"] = df["orig_index"].map(responses)
 
-
     # Save the updated DataFrame
     df.to_csv("updated_dataframe.csv", index=False)
 
     print("✅DataFrame updated successfully!")
 
-def upload_new_batch(request_index,client):
 
+def upload_new_batch(request_index, client, path):
+    batch_path = os.path.join(path, f"batch_requests/batch_{request_index}.jsonl")
     batch_input_file = client.files.create(
-        file=open(f"batch_requests/batch_{request_index}.jsonl","rb"),
+        file=open(batch_path, "rb"),
         purpose="batch"
     )
     return batch_input_file
 
-def evaluate_batch(batch_input_file,client):
+
+def evaluate_batch(batch_input_file, client):
     current_batch = client.batches.create(
         input_file_id=batch_input_file.id,  # or whatever your variable name is
         endpoint="/v1/chat/completions",
@@ -123,32 +131,45 @@ def evaluate_batch(batch_input_file,client):
             "description": "nightly eval job"
         }
     )
-    return current_batch  
+    return current_batch
+
 
 def check_status(current_batch, client):
-      current_batch = client.batches.retrieve(current_batch.id)
-      return current_batch.status
+    current_batch = client.batches.retrieve(current_batch.id)
+    return current_batch.status
 
-def save_response_to_jsonl(current_batch,request_index,client):
-  file_response = client.files.content(current_batch.output_file_id)
 
-  #save to jsonl
-  with open(f"batch_{request_index}_output.jsonl", "wb") as f:
-      f.write(file_response.content)
-  
+def save_response_to_jsonl(current_batch, request_index, client):
+    file_response = client.files.content(current_batch.output_file_id)
 
-def save_to_csv(df,path):
-  df.to_csv(os.path.join(path,"../output/cleaned.csv"), index=False)
+    # save to jsonl
+    with open(f"batch_{request_index}_output.jsonl", "wb") as f:
+        f.write(file_response.content)
 
-def loop_batch_clean(df,client,path,requests = [0,12]):
-    for request_index in range(requests[0],requests[1]):
-        batch_input_file = upload_new_batch(request_index,client)
-        current_batch = evaluate_batch(batch_input_file,client)
-        while check_status(current_batch,client) != "completed":
+
+def save_to_csv(df, path):
+    df.to_csv(os.path.join(path, "../output/cleaned.csv"), index=False)
+
+
+def loop_batch_clean(df, client, path, requests=[0, 12]):
+    for request_index in range(requests[0], requests[1]):
+
+        batch_input_file = upload_new_batch(request_index, client, path)
+        current_batch = evaluate_batch(batch_input_file, client)
+        print(f"successfully sent batch {request_index} ✅\n batch index: {current_batch.id}")
+        while check_status(current_batch, client) != "completed":
             time.sleep(300)
-        save_response_to_jsonl(current_batch,request_index,client)
-        merge_response_to_df(df,f"batch_{request_index}_output.jsonl")
-        save_to_csv(df,path)
+        time.sleep(300)
+        current_batch = client.batches.retrieve(current_batch.id)
+        save_response_to_jsonl(current_batch, request_index, client)
+        merge_response_to_df(df, f"batch_{request_index}_output.jsonl")
+        save_to_csv(df, path)
 
 
-
+# read the /content/batch_6_output.jsonl json file
+def read_jsonl(file_path):
+    data = []
+    with open(file_path, "r") as file:
+        for line in file:
+            data.append(json.loads(line))
+    return data
