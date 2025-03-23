@@ -150,20 +150,75 @@ def save_response_to_jsonl(current_batch, request_index, client):
 def save_to_csv(df, path):
     df.to_csv(os.path.join(path, "../output/cleaned.csv"), index=False)
 
+def process_batch_output(current_batch, request_index, client, path, df):
+    """
+    retrieve the completed batch, save the response to jsonl, merge the response to the dataframe, and save the dataframe to csv
+    :param current_batch: a completed batch
+    :param request_index:
+    :param client:
+    :param path:
+    :param df:
+    :return:
+    """
+    # retrieve the current batch to refresh the status
+    current_batch = client.batches.retrieve(current_batch.id)
+    # save the response to jsonl
+    save_response_to_jsonl(current_batch, request_index, client)
+    # merge the response to the dataframe
+    merge_response_to_df(df, f"batch_{request_index}_output.jsonl")
+    # save the dataframe to csv
+    save_to_csv(df, path)
+
+def send_new_request(client, path, request_index):
+    batch_input_file = upload_new_batch(request_index, client, path)
+    current_batch = evaluate_batch(batch_input_file, client)
+    return current_batch
+
 
 def loop_batch_clean(df, client, path, requests=[0, 12]):
     for request_index in range(requests[0], requests[1]):
 
         batch_input_file = upload_new_batch(request_index, client, path)
+        # send the batch to openai for evaluation
         current_batch = evaluate_batch(batch_input_file, client)
         print(f"successfully sent batch {request_index} ✅\n batch index: {current_batch.id}")
+        # wait for batch to complete
         while check_status(current_batch, client) != "completed":
             time.sleep(300)
         time.sleep(300)
-        current_batch = client.batches.retrieve(current_batch.id)
-        save_response_to_jsonl(current_batch, request_index, client)
-        merge_response_to_df(df, f"batch_{request_index}_output.jsonl")
-        save_to_csv(df, path)
+        # retrieve and process response
+        process_batch_output(current_batch, request_index, client, path, df)
+
+
+
+def loop_batch_eval_with_queue(df, client, path, requests=[0, 12],delay=300):
+    q = []
+    request_index = requests[0]
+
+    # send the first batch
+    current_request = send_new_request(client, path, request_index)
+    request_index += 1
+
+    # loop through the rest of the requests
+    while request_index < requests[1]:
+        time.sleep(delay)
+        current_status = check_status(current_request, client)
+
+        # if current batch is finalizing, enqueue it and send a new batch
+        if current_status == "finalizing":
+            q.append((current_request, request_index))
+            # send the next
+            current_request = send_new_request(client, path, request_index)
+            request_index += 1
+
+        # if there exists a completed batch in the queue, process it
+        for request, request_i in q:
+            if check_status(request, client) == "completed":
+                time.sleep(delay)
+                process_batch_output(request, request_i, client, path, df)
+                q.remove(request)
+
+
 
 
 # read the /content/batch_6_output.jsonl json file
@@ -173,3 +228,32 @@ def read_jsonl(file_path):
         for line in file:
             data.append(json.loads(line))
     return data
+
+
+def broken_loop_batch_clean(df,
+                            client,
+                            path,
+                            requests=[20, 60],
+                            batch_id="did you forget to input the correct batch id?"):
+    # initialize with broken batch
+    current_batch = client.batches.retrieve(batch_id)
+    print(f"successfully retrieved batch {requests[0]} ✅\n batch index: {current_batch.id}")
+
+    # now loop from the NEXT ONE but with phase
+    for request_index in range(requests[0] + 1, requests[1]):
+
+        # wait for initial batch to complete
+        while check_status(current_batch, client) != "completed":
+            time.sleep(300)
+
+        # fetch results, update everything
+        current_batch = client.batches.retrieve(current_batch.id)
+        save_response_to_jsonl(current_batch, request_index, client)
+        merge_response_to_df(df, f"batch_{request_index}_output.jsonl")
+        save_to_csv(df, path)
+
+        # move to next phase, then repeate.
+        batch_input_file = upload_new_batch(request_index, client, path)
+        current_batch = evaluate_batch(batch_input_file, client)
+        print(f"successfully sent batch {request_index} ✅\n batch index: {current_batch.id}")
+
