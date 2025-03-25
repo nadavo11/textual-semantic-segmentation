@@ -212,12 +212,14 @@ def loop_batch_eval_with_queue(df, client, path, requests=[0, 12],delay=300):
             request_index += 1
 
         # if there exists a completed batch in the queue, process it
-        for request, request_i in q:
+        if q:
+            request, request_i = q.pop()
+
             if check_status(request, client) == "completed":
                 time.sleep(delay)
                 process_batch_output(request, request_i, client, path, df)
-                q.remove(request)
-
+            else:
+                q.append(request)
 
 
 
