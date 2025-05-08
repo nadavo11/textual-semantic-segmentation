@@ -22,15 +22,11 @@ def trim(df, column, interval):
     return df
 
 
-def create_batch_requests(df, BATCH_SIZE=50000, path=''):
+def create_batch_requests(df,system_message, BATCH_SIZE=50000, path='',column_name="text"):
     # OpenAI batch limit
     total_batches = (len(df) // BATCH_SIZE) + (1 if len(df) % BATCH_SIZE != 0 else 0)
 
-    # Define system message
-    system_message = {
-        "role": "system",
-        "content": "You are a highly precise and reliable assistant. Your task is to extract and retain only the core 'About Us' content from the provided scraped text. Remove any extraneous elements such as headings, promotions, or button text that may appear at the beginning or end. If no clear 'About Us' section exists, return an empty response rather than generating one. do not add anything that did not exist in the text before. If the text is not in English, translate it into English. Output only the cleaned and, if necessary, translated 'About Us' content, with no additional comments or formatting."
-    }
+
     # Create output directory
     output_dir = "batch_requests"
     path = os.path.join(path, output_dir)
@@ -48,11 +44,11 @@ def create_batch_requests(df, BATCH_SIZE=50000, path=''):
         with open(batch_filename, "w", encoding="utf-8") as f:
             # Iterate over rows in the current batch
             for i, row in batch_df.iterrows():
-                text = row["text"]
+                text = row[column_name]  # <-- Use the df's "text" column
                 orig_index = row["orig_index"]
 
                 custom_id = f"request-{orig_index}"  # <-- Use the df's "id" column
-                max_tokens = row["num_tokens"]  # <-- Use the df's "num_tokens" column
+                max_tokens = row["num_tokens"]+500  # <-- Use the df's "num_tokens" column
 
                 # Construct the request
                 request = {
@@ -79,8 +75,37 @@ def create_batch_requests(df, BATCH_SIZE=50000, path=''):
 import pandas as pd
 import json
 
+def clean_df(df,responses):
+    df.loc[df["text_clean"].isna(), "text_clean"] = df["orig_index"].map(responses)
 
-def merge_response_to_df(df, response_file):
+def analyze_story_elements(df,responses):
+    # assume `responses` is a dict mapping orig_index -> response dict
+    mask = df["text_clean"].isna()
+    cols = [
+        "causal_sequence",
+        "characters",
+        "internal_states",
+        "plot_structure",
+        "normative_point"
+    ]
+
+    # pre-build mapping dicts
+    value_maps = {
+        col: {idx: resp[col]["value"] for idx, resp in responses.items()}
+        for col in cols
+    }
+    reason_maps = {
+        col: {idx: resp[col]["reason"] for idx, resp in responses.items()}
+        for col in cols
+    }
+
+    # vectorized assignment
+    for col in cols:
+        df.loc[mask, f"{col}_value"] = df.loc[mask, "orig_index"].map(value_maps[col])
+        df.loc[mask, f"{col}_reason"] = df.loc[mask, "orig_index"].map(reason_maps[col])
+    return df
+
+def merge_response_to_df(df, response_file,processing_function = analyze_story_elements):
     # Load responses from JSONL file
     responses = {}
 
@@ -105,8 +130,8 @@ def merge_response_to_df(df, response_file):
                 print(f"Skipping malformed line: {line[:100]}... Error: {e}")
 
     # Map extracted responses to the DataFrame
-    df.loc[df["text_clean"].isna(), "text_clean"] = df["orig_index"].map(responses)
 
+    df = processing_function(df, responses)
     # Save the updated DataFrame
     df.to_csv("updated_dataframe.csv", index=False)
 
@@ -150,9 +175,11 @@ def save_response_to_jsonl(current_batch, request_index, client):
 def save_to_csv(df, path):
     df.to_csv(os.path.join(path, "../output/cleaned.csv"), index=False)
 
-def process_batch_output(current_batch, request_index, client, path, df):
+
+def process_batch_output(current_batch, request_index, client, path, df, f=analyze_story_elements):
     """
     retrieve the completed batch, save the response to jsonl, merge the response to the dataframe, and save the dataframe to csv
+    :param f: function to process the dataframe, takes in df and responses
     :param current_batch: a completed batch
     :param request_index:
     :param client:
@@ -165,17 +192,20 @@ def process_batch_output(current_batch, request_index, client, path, df):
     # save the response to jsonl
     save_response_to_jsonl(current_batch, request_index, client)
     # merge the response to the dataframe
-    merge_response_to_df(df, f"batch_{request_index}_output.jsonl")
+    merge_response_to_df(df, f"batch_{request_index}_output.jsonl", f=f)
     # save the dataframe to csv
     save_to_csv(df, path)
+
 
 def send_new_request(client, path, request_index):
     batch_input_file = upload_new_batch(request_index, client, path)
     current_batch = evaluate_batch(batch_input_file, client)
+    print(f"successfully sent batch {request_index} ✅\n batch index: {current_batch.id}")
+
     return current_batch
 
 
-def loop_batch_clean(df, client, path, requests=[0, 12]):
+def loop_batch_clean(df, client, path, requests=[0, 12], f=analyze_story_elements):
     for request_index in range(requests[0], requests[1]):
 
         batch_input_file = upload_new_batch(request_index, client, path)
@@ -187,12 +217,10 @@ def loop_batch_clean(df, client, path, requests=[0, 12]):
             time.sleep(300)
         time.sleep(300)
         # retrieve and process response
-        process_batch_output(current_batch, request_index, client, path, df)
+        process_batch_output(current_batch, request_index, client, path, df, f=f)
 
 
-
-def loop_batch_eval_with_queue(df, client, path, requests=[0, 12],delay=300):
-    q = []
+def loop_batch_eval_with_queue(df, client, path, requests=[0, 12], delay=300,f= analyze_story_elements, q=[]):
     request_index = requests[0]
 
     # send the first batch
@@ -205,22 +233,23 @@ def loop_batch_eval_with_queue(df, client, path, requests=[0, 12],delay=300):
         current_status = check_status(current_request, client)
 
         # if current batch is finalizing, enqueue it and send a new batch
-        if current_status == "finalizing":
+        if current_status == "finalizing" or current_status == "completed":
             q.append((current_request, request_index))
+            print(f"enqueued batch {request_index - 1} ✅\n batch index: {current_request.id}")
+
             # send the next
             current_request = send_new_request(client, path, request_index)
             request_index += 1
 
         # if there exists a completed batch in the queue, process it
         if q:
-            request, request_i = q.pop()
-
+            r = q.pop(0)
+            request, request_i = r
             if check_status(request, client) == "completed":
                 time.sleep(delay)
-                process_batch_output(request, request_i, client, path, df)
+                process_batch_output(request, request_i, client, path, df, f=f)
             else:
-                q.append(request)
-
+                q.append((request, request_i))
 
 
 # read the /content/batch_6_output.jsonl json file
