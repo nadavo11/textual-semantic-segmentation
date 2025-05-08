@@ -158,7 +158,7 @@ def save_to_csv(df, path):
     df.to_csv(os.path.join(path, "../output/narrative_elements.csv"), index=False)
 
 
-def process_batch_output(current_batch, request_index, client, path, df):
+def process_batch_output(current_batch, request_index, client, path, df, task: Task):
     """
     retrieve the completed batch, save the response to jsonl, merge the response to the dataframe, and save the dataframe to csv
     :param f: function to process the dataframe, takes in df and responses
@@ -174,7 +174,7 @@ def process_batch_output(current_batch, request_index, client, path, df):
     # save the response to jsonl
     save_response_to_jsonl(current_batch, request_index, client)
     # merge the response to the dataframe
-    merge_response_to_df(df, f"batch_{request_index}_output.jsonl" )
+    merge_response_to_df(df, f"batch_{request_index}_output.jsonl",task = task) )
     # save the dataframe to csv
     save_to_csv(df, path)
 
@@ -191,8 +191,14 @@ def loop_batch_eval_with_queue(
                                 path,
                                 requests=[0, 12],
                                 delay=300,
-                                task: Task = None,
+                                task: Task = narrative_task,
+                                folder_name = None,
                                 q=[]):
+
+    if folder_name:
+        os.makedirs(os.path.join(path, folder_name), exist_ok=True)
+        path = os.path.join(path, folder_name)
+
     request_index = requests[0]
     current_request = send_new_request(client, path, request_index,)
     request_index += 1
@@ -211,7 +217,7 @@ def loop_batch_eval_with_queue(
             request, request_i = r
             if check_status(request, client) == "completed":
                 time.sleep(delay)
-                process_batch_output(request, request_i, client, path, df)
+                process_batch_output(request, request_i, client, path, df,task=task)
             else:
                 q.append((request, request_i))
 
