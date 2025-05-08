@@ -197,7 +197,10 @@ def loop_batch_eval_with_queue(
 
     if folder_name:
         os.makedirs(os.path.join(path, folder_name), exist_ok=True)
-        path = os.path.join(path, folder_name)
+        output_path = os.path.join(path, folder_name)
+    else:
+        os.makedirs(os.path.join(path, "output"), exist_ok=True)
+        output_path = os.path.join(path, "output")
 
     request_index = requests[0]
     current_request = send_new_request(client, path, request_index,)
@@ -217,7 +220,7 @@ def loop_batch_eval_with_queue(
             request, request_i = r
             if check_status(request, client) == "completed":
                 time.sleep(delay)
-                process_batch_output(request, request_i, client, path, df,task=task)
+                process_batch_output(request, request_i, client, output_path, df,task=task)
             else:
                 q.append((request, request_i))
 
