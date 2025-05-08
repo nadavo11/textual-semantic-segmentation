@@ -174,7 +174,7 @@ def process_batch_output(current_batch, request_index, client, path, df, task: T
     # save the response to jsonl
     save_response_to_jsonl(current_batch, request_index, client)
     # merge the response to the dataframe
-    merge_response_to_df(df, f"batch_{request_index}_output.jsonl",task = task) )
+    merge_response_to_df(df, f"batch_{request_index}_output.jsonl",task = task )
     # save the dataframe to csv
     save_to_csv(df, path)
 
