@@ -9,6 +9,7 @@ SYSTEM_MESSAGE ={"role": "system",
     (3) events that affect the characters and/or their mental states;
     (4) a plot or structure;
     (5) a normative point.
+    provide a very short sentence explaining your reasoning for each element.
 
 Return your answer as JSON:
 {
@@ -64,7 +65,7 @@ def create_batch_requests(df,task:Task, BATCH_SIZE=50000, path='',column_name="t
                 orig_index = row["orig_index"]
 
                 custom_id = f"request-{orig_index}"  # <-- Use the df's "id" column
-                max_tokens = 200  # <-- Use the df's "num_tokens" column
+                max_tokens = 800  # <-- Use the df's "num_tokens" column
 
                 # Construct the request
                 request = {
