@@ -199,8 +199,8 @@ def loop_batch_eval_with_queue(
         os.makedirs(os.path.join(path, folder_name), exist_ok=True)
         output_path = os.path.join(path, folder_name)
     else:
-        os.makedirs(os.path.join(path, "output"), exist_ok=True)
-        output_path = os.path.join(path, "output")
+        os.makedirs(os.path.join(path, "name_output"), exist_ok=True)
+        output_path = os.path.join(path, "name_output")
 
     request_index = requests[0]
     current_request = send_new_request(client, path, request_index,)
