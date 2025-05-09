@@ -107,7 +107,18 @@ def merge_response_to_df(df, response_file, task: Task):
                 orig_id = int(custom_id.split("-")[-1])
 
                 response_text = data.get("response", {}).get("body", {}).get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                responses[orig_id] = task.parser(response_text)
+                # responses[orig_id] = task.parser(response_text)
+                try:
+                    parsed_content = json.loads(response_text)  # <- safely unpack GPT's inner JSON string
+                except json.JSONDecodeError:
+                    try:
+                        import ast
+                        parsed_content = ast.literal_eval(response_text)
+                    except Exception as e:
+                        print(f"⚠️ Failed to parse GPT response at {orig_id}: {e}")
+                        parsed_content = {}
+
+                responses[orig_id] = task.parser(parsed_content)
 
             except Exception as e:
                 print(f"Skipping line due to error: {e}")
