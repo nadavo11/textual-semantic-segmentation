@@ -2,6 +2,8 @@ from typing import Callable, Dict, Any
 import os
 import json
 import time
+import pandas as pd
+
 SYSTEM_MESSAGE ={"role": "system",
         "content": """Analyze the following text and evaluate whether it contains each of the following elements:
     (1) causally connected events;
@@ -11,7 +13,7 @@ SYSTEM_MESSAGE ={"role": "system",
     (5) a normative point.
     provide a very short sentence explaining your reasoning for each element.
 
-Return your answer as JSON:
+Return your answer as JSON,Return raw JSON only. Do not wrap the output in code blocks or additional characters of any sort:
 {
   "causal_sequence": {"value": 0 or 1, "reason": "..."},
   "characters": {"value": 0 or 1, "reason": "..."},
@@ -96,40 +98,31 @@ narrative_task = Task(
     parser_fn=parse_narrative_with_reasons
 )
 
-def merge_response_to_df(df, response_file, task: Task):
-    responses = {}
-
+def merge_response_to_df(df: pd.DataFrame, response_file: str, task) -> pd.DataFrame:
     with open(response_file, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue  # skip blank lines
+
             try:
-                data = json.loads(line.strip())
+                data = json.loads(line)
                 custom_id = data.get("custom_id", "")
-                orig_id = int(custom_id.split("-")[-1])
+                orig_index = int(custom_id.split("-")[-1])
 
-                response_text = data.get("response", {}).get("body", {}).get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                # responses[orig_id] = task.parser(response_text)
-                try:
-                    parsed_content = json.loads(response_text)  # <- safely unpack GPT's inner JSON string
-                except json.JSONDecodeError:
-                    try:
-                        import ast
-                        parsed_content = ast.literal_eval(response_text)
-                    except Exception as e:
-                        print(f"⚠️ Failed to parse GPT response at {orig_id}: {e}")
-                        parsed_content = {}
+                content_str = data["response"]["body"]["choices"][0]["message"]["content"]
+                content = json.loads(content_str)
 
-                responses[orig_id] = task.parser(parsed_content)
+                for key, val in content.items():
+                    df.loc[df["orig_index"] == orig_index, f"{key}_value"] = val.get("value")
+                    df.loc[df["orig_index"] == orig_index, f"{key}_reason"] = val.get("reason")
 
             except Exception as e:
-                print(f"Skipping line due to error: {e}")
+                print(f"⚠️ Skipping line {line_num} (custom_id: {custom_id if 'custom_id' in locals() else '?'}) due to error: {e}")
 
-    # Merge responses into df
-    for i, result in responses.items():
-        for key, value in result.items():
-            df.at[i, key] = value
-
-    print("✅ Merged parsed responses into DataFrame")
+    print("✅ Merged batch responses into DataFrame")
     return df
+
 
 
 def upload_new_batch(request_index, client, path):
