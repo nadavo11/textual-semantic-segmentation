@@ -160,7 +160,7 @@ def save_response_to_jsonl(current_batch, request_index, client):
 
 
 def save_to_csv(df, path):
-    df.to_csv(os.path.join(path, "../output/narrative_elements.csv"), index=False)
+    df.to_csv(os.path.join(path, "narrative_elements.csv"), index=False)
 
 
 def process_batch_output(current_batch, request_index, client, path, df, task: Task):
@@ -181,7 +181,10 @@ def process_batch_output(current_batch, request_index, client, path, df, task: T
     # merge the response to the dataframe
     merge_response_to_df(df, f"batch_{request_index}_output.jsonl",task = task )
     # save the dataframe to csv
+    
     save_to_csv(df, path)
+    # report the status
+    print(f"Batch {request_index} completed and saved to CSV at {path} ✅")
 
 def send_new_request(client, path, request_index):
     batch_input_file = upload_new_batch(request_index, client, path)
@@ -199,13 +202,13 @@ def loop_batch_eval_with_queue(
                                 task: Task = narrative_task,
                                 folder_name = None,
                                 q=[]):
-
+    out_path = os.path.join(path, "../output")
     if folder_name:
-        os.makedirs(os.path.join(path, folder_name), exist_ok=True)
-        output_path = os.path.join(path, folder_name)
+        os.makedirs(os.path.join(out_path, folder_name), exist_ok=True)
+        output_path = os.path.join(out_path, folder_name)
     else:
-        os.makedirs(os.path.join(path, "name_output"), exist_ok=True)
-        output_path = os.path.join(path, "name_output")
+        os.makedirs(os.path.join(out_path, "name_output"), exist_ok=True)
+        output_path = os.path.join(out_path, "name_output")
 
     request_index = requests[0]
     current_request = send_new_request(client, path, request_index,)
