@@ -4,8 +4,8 @@ import json
 import time
 import pandas as pd
 
-SYSTEM_MESSAGE ={"role": "system",
-        "content": """Analyze the following text and evaluate whether it contains each of the following elements:
+SYSTEM_MESSAGE = {"role": "system",
+                  "content": """Analyze the following text and evaluate whether it contains each of the following elements:
     (1) causally connected events;
     (2) characters;
     (3) events that affect the characters and/or their mental states;
@@ -21,11 +21,14 @@ Return your answer as JSON,Return raw JSON only. Do not wrap the output in code 
   "plot_structure": {"value": 0 or 1, "reason": "..."},
   "normative_point": {"value": 0 or 1, "reason": "..."}
 }"""}
+
+
 class Task:
     def __init__(self, name: str, system_message: str, parser_fn: Callable[[str], Dict[str, Any]]):
         self.name = name
         self.system_message = system_message
         self.parser = parser_fn
+
 
 def parse_narrative_with_reasons(response_str):
     import json
@@ -41,10 +44,9 @@ def parse_narrative_with_reasons(response_str):
     return result
 
 
-def create_batch_requests(df,task:Task, BATCH_SIZE=50000, path='',column_name="text"):
+def create_batch_requests(df, task: Task, BATCH_SIZE=50000, path='', column_name="text"):
     # OpenAI batch limit
     total_batches = (len(df) // BATCH_SIZE) + (1 if len(df) % BATCH_SIZE != 0 else 0)
-
 
     # Create output directory
     output_dir = "batch_requests"
@@ -93,10 +95,11 @@ def create_batch_requests(df,task:Task, BATCH_SIZE=50000, path='',column_name="t
 
 narrative_task = Task(
     name="narrative_analysis",
-    system_message= SYSTEM_MESSAGE
-,
+    system_message=SYSTEM_MESSAGE
+    ,
     parser_fn=parse_narrative_with_reasons
 )
+
 
 def merge_response_to_df(df: pd.DataFrame, response_file: str, task) -> pd.DataFrame:
     with open(response_file, "r", encoding="utf-8") as f:
@@ -118,11 +121,11 @@ def merge_response_to_df(df: pd.DataFrame, response_file: str, task) -> pd.DataF
                     df.loc[df["orig_index"] == orig_index, f"{key}_reason"] = val.get("reason")
 
             except Exception as e:
-                print(f"⚠️ Skipping line {line_num} (custom_id: {custom_id if 'custom_id' in locals() else '?'}) due to error: {e}")
+                print(
+                    f"⚠️ Skipping line {line_num} (custom_id: {custom_id if 'custom_id' in locals() else '?'}) due to error: {e}")
 
     print("✅ Merged batch responses into DataFrame")
     return df
-
 
 
 def upload_new_batch(request_index, client, path):
@@ -179,12 +182,13 @@ def process_batch_output(current_batch, request_index, client, path, df, task: T
     # save the response to jsonl
     save_response_to_jsonl(current_batch, request_index, client)
     # merge the response to the dataframe
-    merge_response_to_df(df, f"batch_{request_index}_output.jsonl",task = task )
+    merge_response_to_df(df, f"batch_{request_index}_output.jsonl", task=task)
     # save the dataframe to csv
-    
+
     save_to_csv(df, path)
     # report the status
     print(f"Batch {request_index} completed and saved to CSV at {path} ✅")
+
 
 def send_new_request(client, path, request_index):
     batch_input_file = upload_new_batch(request_index, client, path)
@@ -193,15 +197,17 @@ def send_new_request(client, path, request_index):
 
     return current_batch
 
+
 def loop_batch_eval_with_queue(
-                                df,
-                                client,
-                                path,
-                                requests=[0, 12],
-                                delay=300,
-                                task: Task = narrative_task,
-                                folder_name = None,
-                                q=[]):
+        df,
+        client,
+        path,
+        requests=[0, 12],
+        delay=300,
+        task: Task = narrative_task,
+        folder_name=None,
+        q=[],
+        q_cap=1):
     out_path = os.path.join(path, "../output")
     if folder_name:
         os.makedirs(os.path.join(out_path, folder_name), exist_ok=True)
@@ -211,14 +217,14 @@ def loop_batch_eval_with_queue(
         output_path = os.path.join(out_path, "name_output")
 
     request_index = requests[0]
-    current_request = send_new_request(client, path, request_index,)
+    current_request = send_new_request(client, path, request_index, )
     request_index += 1
 
     while request_index < requests[1]:
         time.sleep(delay)
         current_status = check_status(current_request, client)
 
-        if current_status in ["finalizing", "completed"]:
+        if len(q) < q_cap or current_status in ["finalizing", "completed"]:
             q.append((current_request, request_index))
             current_request = send_new_request(client, path, request_index)
             request_index += 1
@@ -228,7 +234,7 @@ def loop_batch_eval_with_queue(
             request, request_i = r
             if check_status(request, client) == "completed":
                 time.sleep(delay)
-                process_batch_output(request, request_i, client, output_path, df,task=task)
+                process_batch_output(request, request_i, client, output_path, df, task=task)
             else:
                 q.append((request, request_i))
 
