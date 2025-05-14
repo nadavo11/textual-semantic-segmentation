@@ -238,4 +238,12 @@ def loop_batch_eval_with_queue(
             else:
                 q.append((request, request_i))
 
-            ######
+    ###### endgame
+    while q:
+        r = q.pop(0)
+        request, request_i = r
+        if check_status(request, client) == "completed":
+            time.sleep(delay)
+            process_batch_output(request, request_i, client, output_path, df, task=task)
+        else:
+            q.append((request, request_i))
