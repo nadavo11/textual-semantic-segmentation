@@ -9,19 +9,34 @@ import ntpath
 import random
 
 def encode_column(model, filename, col_name):
+    print("📖 read csv")
     df = pd.read_csv(filename)
+    
     df = df.dropna(subset=[col_name])
-    df["embedding"] = list(model.encode(df[col_name]))
+    print("🧬embedding column...")
+    df["embedding"] = list(model.encode(df[col_name],batch_size=2048))
     return df
 
 
+from tqdm import tqdm
+from sentence_transformers import util
+
 def item_level_ccr(data_encoded_df, questionnaire_encoded_df):
+    print("🔍 Computing cosine similarities between data and questionnaire embeddings...")
+    
     q_embeddings = questionnaire_encoded_df.embedding
     d_embeddings = data_encoded_df.embedding
+
     similarities = util.pytorch_cos_sim(d_embeddings, q_embeddings)
-    for i in range(1, len(questionnaire_encoded_df) + 1):
-        data_encoded_df["sim_item_{}".format(i)] = similarities[:, i - 1]
+
+    print("📊 Populating similarity scores into DataFrame...")
+
+    for i in tqdm(range(1, len(questionnaire_encoded_df) + 1), desc="Computing sim_item_X columns"):
+        data_encoded_df[f"sim_item_{i}"] = similarities[:, i - 1]
+
+    print("✅ Similarity computation complete.")
     return data_encoded_df
+
 
 
 def ccr_wrapper(data_file, data_col, q_file, q_col, model='all-MiniLM-L6-v2'):
@@ -36,10 +51,13 @@ def ccr_wrapper(data_file, data_col, q_file, q_col, model='all-MiniLM-L6-v2'):
         model (str): name of the SBERT model to use for CCR see https://www.sbert.net/docs/pretrained_models.html for full list
 
     """
+    print("hola mundo")
     try:
-        model = SentenceTransformer(model)
+        model = SentenceTransformer(model, device="cuda").to('cuda')
+        print("model successfully mounted on cuda⚡")
     except:
-        model = SentenceTransformer('all-MiniLM-L6-v2')
+        model = SentenceTransformer('all-MiniLM-L6-v2', device="cuda").to('cuda')
+        print("model successfully mounted on cuda⚡")
     questionnaire_filename = q_file
     data_filename = data_file
 
