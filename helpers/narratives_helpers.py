@@ -18,6 +18,44 @@ import matplotlib.pyplot as plt
 from scipy.stats import linregress
 
 
+def plot_narrative_prevalence(df, min_samples=100):
+    # Define narrative element columns
+    elements = ["causal_sequence", "characters", "internal_states", "plot_structure", "normative_point"]
+    value_cols = [f"{el}_value" for el in elements]
+
+    # Drop rows with missing country or any narrative element
+    df = df.dropna(subset=["country_code"] + value_cols)
+    df["country_code"] = df["country_code"].astype(str)
+
+    # Add a flag: does this row have all 5 narrative elements?
+    df["has_all_5"] = df[value_cols].sum(axis=1) == 5
+
+    # Count total and 'narrative' per country
+    country_counts = df["country_code"].value_counts()
+    eligible_countries = country_counts[country_counts >= min_samples].index
+
+    df_filtered = df[df["country_code"].isin(eligible_countries)]
+
+    total_counts = df_filtered["country_code"].value_counts()
+    narrative_counts = df_filtered[df_filtered["has_all_5"]]["country_code"].value_counts()
+
+    # Compute percentage
+    prevalence_pct = (narrative_counts / total_counts.loc[narrative_counts.index]) * 100
+    prevalence_pct = prevalence_pct.sort_values(ascending=False)
+
+    # Plot
+    plt.figure(figsize=(10, 5))
+    prevalence_pct.plot(kind="bar", color="purple")
+    plt.ylabel("Percentage of Texts with All 5 Narrative Elements")
+    plt.xlabel("Country Code")
+    plt.title(f"Narrative Prevalence by Country (min {min_samples} samples)")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+    return prevalence_pct
+
+
 # ---------------------------------------------------------------------------
 # 1) EXACT function as requested: plot_narrative_vs_trust
 # ---------------------------------------------------------------------------
@@ -374,11 +412,13 @@ def countrywise_regression(
         plt.tight_layout()
         plt.show()
 
-    return reg_table, merged
+    return reg_table
 
 
 __all__ = [
+  "plot_narrative_prevalence",
     "plot_narrative_vs_trust",
     "prevalence_vs_metrics",
     "countrywise_regression",
+
 ]
