@@ -16,493 +16,333 @@ Includes:
 import pandas as pd
 import numpy as np
 from sentence_transformers import SentenceTransformer, util
-from tqdm import tqdm
-import re, sys, string, ntpath, random
-from sklearn.feature_extraction.text import CountVectorizer
 
-# --- NEW: long-text support helpers -----------------------------------------
-from typing import List, Tuple, Iterable, Callable
+import re
+import sys
+import string
+import ntpath
+import random
 
-def _get_tokenizer(model_name_or_obj):
-    """
-    Return a HuggingFace tokenizer aligned with the SentenceTransformer.
-    Accepts a model name (str) or an instantiated SentenceTransformer.
-    """
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        raise RuntimeError("transformers is required for token-aware chunking. pip install transformers")
+def encode_column(model, filename, col_name):
+    print("📖 read csv")
+    df = pd.read_csv(filename)
 
-    if isinstance(model_name_or_obj, str):
-        return AutoTokenizer.from_pretrained(model_name_or_obj, use_fast=True)
-    # SentenceTransformer object
-    try:
-        # Most SBERT models expose the underlying HF tokenizer this way:
-        return model_name_or_obj._first_module().tokenizer
-    except Exception:
-        # Fallback: try model name field (not always available)
-        try:
-            return AutoTokenizer.from_pretrained(model_name_or_obj.model_card, use_fast=True)
-        except Exception:
-            raise RuntimeError("Could not access tokenizer from SentenceTransformer instance.")
-
-
-def count_tokens(text: str, tokenizer, add_special_tokens: bool = True) -> int:
-    """Number of wordpiece tokens for `text` with the given tokenizer."""
-    return len(tokenizer.encode(text, add_special_tokens=add_special_tokens))
-
-
-def _simple_sentence_split(paragraph: str) -> List[str]:
-    """
-    Lightweight sentence splitter (no NLTK dependency).
-    Splits on . ! ? while keeping punctuation attached.
-    """
-    # Normalize whitespace
-    p = re.sub(r'\s+', ' ', paragraph.strip())
-    if not p:
-        return []
-    # Split on sentence terminators followed by space or end
-    # Keep the terminator by using a capturing group.
-    parts = re.split(r'([.!?])\s+', p)
-    if len(parts) == 1:
-        return [p]
-    sents = []
-    # Re-attach punctuation captured in odd positions
-    for i in range(0, len(parts), 2):
-        seg = parts[i]
-        if not seg:
-            continue
-        if i + 1 < len(parts):
-            seg = seg + parts[i + 1]
-        sents.append(seg.strip())
-    return sents
-
-
-def _pack_by_token_budget(
-    units: List[str],
-    tokenizer,
-    max_tokens: int,
-    overlap_tokens: int = 0
-) -> List[str]:
-    """
-    Pack a list of units (sentences or paragraphs) into chunks that fit in `max_tokens`.
-    If a single unit overflows by itself, it will be split greedily by word.
-    """
-    chunks = []
-    cur = []
-    cur_count = 0
-
-    def push_current():
-        nonlocal cur, cur_count
-        if cur:
-            chunks.append(' '.join(cur).strip())
-            cur, cur_count = [], 0
-
-    for u in units:
-        u = u.strip()
-        if not u:
-            continue
-        u_tokens = tokenizer.encode(u, add_special_tokens=False)
-        u_len = len(u_tokens)
-
-        # If unit alone is too big, split by words greedily
-        if u_len > max_tokens:
-            # push whatever accumulated first
-            push_current()
-            words = u.split()
-            left = 0
-            while left < len(words):
-                # grow window until it exceeds budget
-                # binary/linear mix for simplicity
-                right = min(len(words), left + 1)
-                best_right = right
-                while right <= len(words):
-                    cand = ' '.join(words[left:right])
-                    if len(tokenizer.encode(cand, add_special_tokens=False)) <= max_tokens:
-                        best_right = right
-                        right += 1
-                    else:
-                        break
-                chunk = ' '.join(words[left:best_right])
-                chunks.append(chunk)
-                if overlap_tokens > 0 and best_right < len(words):
-                    # Construct overlap window from tail tokens of last chunk
-                    # (token-level precise overlap is expensive; we approximate with words)
-                    pass
-                left = best_right
-            continue
-
-        # Try adding to current chunk
-        new_count = len(tokenizer.encode((' '.join(cur + [u])).strip(), add_special_tokens=False))
-        if new_count <= max_tokens:
-            cur.append(u)
-            cur_count = new_count
-        else:
-            # Close current and start new
-            push_current()
-            cur = [u]
-            cur_count = u_len
-
-    push_current()
-
-    # Optional sliding-window token overlap between chunks (approximate)
-    if overlap_tokens > 0 and len(chunks) > 1:
-        overlapped = []
-        prev_tail = None
-        for i, ch in enumerate(chunks):
-            if i > 0 and prev_tail:
-                merged = (prev_tail + " " + ch).strip()
-                # If merging exceeds budget, keep ch as is
-                if len(tokenizer.encode(merged, add_special_tokens=False)) <= max_tokens:
-                    overlapped.append(merged)
-                else:
-                    overlapped.append(ch)
-            else:
-                overlapped.append(ch)
-            # compute tail snippet by token count
-            toks = tokenizer.encode(ch, add_special_tokens=False)
-            if len(toks) > overlap_tokens:
-                # get last ~overlap_tokens worth of words (approximate)
-                words = ch.split()
-                # back off words until ~overlap token budget
-                tail = []
-                for w in reversed(words):
-                    cand = (' '.join([w] + tail)).strip()
-                    if len(tokenizer.encode(cand, add_special_tokens=False)) <= overlap_tokens:
-                        tail.insert(0, w)
-                    else:
-                        break
-                prev_tail = ' '.join(tail)
-            else:
-                prev_tail = ch
-        chunks = overlapped
-
-    return chunks
-
-
-def chunk_text(
-    text: str,
-    tokenizer,
-    max_tokens: int = 384,
-    overlap_tokens: int = 32
-) -> List[str]:
-    """
-    Paragraph-first chunking; if a paragraph still overflows, split to sentences; if still
-    overflowing, fallback to greedy word packing.
-    Returns a list of chunks that each fit in `max_tokens`.
-    """
-    # Fast path
-    if count_tokens(text, tokenizer) <= max_tokens:
-        return [text.strip()]
-
-    # 1) Split by blank lines into paragraphs
-    paras = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-    chunks: List[str] = []
-
-    for p in paras:
-        if count_tokens(p, tokenizer) <= max_tokens:
-            chunks.append(p)
-            continue
-
-        # 2) paragraph too long -> split to sentences
-        sents = _simple_sentence_split(p)
-        if sents and all(count_tokens(s, tokenizer) <= max_tokens for s in sents):
-            chunks.extend(_pack_by_token_budget(sents, tokenizer, max_tokens, overlap_tokens))
-        else:
-            # 3) extreme case: sentence still too long -> greedy word packing
-            chunks.extend(_pack_by_token_budget([p], tokenizer, max_tokens, overlap_tokens))
-
-    # Final safety: if anything still too long (shouldn’t happen), truncate last-resort
-    safe = []
-    for ch in chunks:
-        if count_tokens(ch, tokenizer) <= max_tokens:
-            safe.append(ch)
-        else:
-            # truncate as a last resort (logically should not be reached)
-            ids = tokenizer.encode(ch, add_special_tokens=False)[:max_tokens]
-            safe.append(tokenizer.decode(ids))
-    return safe
-
-
-def _pool_vectors(
-    vecs: Iterable[np.ndarray],
-    weights: Iterable[float] = None,
-    method: str = "mean"
-) -> np.ndarray:
-    """
-    Pool a list of vectors into one.
-    method: 'mean' | 'length' (length-weighted mean by token count)
-    """
-    arr = np.vstack(vecs)
-    if method == "length" and weights is not None:
-        w = np.array(list(weights), dtype=np.float32).reshape(-1, 1)
-        w = w / (w.sum() + 1e-9)
-        return (arr * w).sum(axis=0)
-    return arr.mean(axis=0)
-
-
-def embed_long_text(
-    model: SentenceTransformer,
-    tokenizer,
-    text: str,
-    max_tokens: int = 384,
-    overlap_tokens: int = 32,
-    pooling: str = "mean"
-) -> np.ndarray:
-    """
-    Token-aware embedding for long documents:
-    - chunk by token budget
-    - encode each chunk
-    - pool back to a single vector
-    """
-    chunks = chunk_text(text, tokenizer, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
-    # Track lengths to optionally weight pooling
-    lengths = [count_tokens(c, tokenizer, add_special_tokens=False) for c in chunks]
-    embs = model.encode(chunks, batch_size=min(64, len(chunks)) if len(chunks) > 0 else 1, convert_to_numpy=True)
-    if isinstance(embs, list):
-        embs = np.vstack(embs)
-    if pooling == "length":
-        return _pool_vectors(embs, weights=lengths, method="length")
-    return _pool_vectors(embs, method="mean")
-# --- end NEW helpers ---------------------------------------------------------
-
-
-def encode_column(model, filename, col_name,
-                  tokenizer=None,
-                  max_tokens=384,
-                  overlap_tokens=32,
-                  pooling="mean",
-                  warn_on_truncation=True):
-    """
-    Read CSV, drop NA in col_name, and add embeddings as 'embedding'.
-    For long texts, uses token-aware chunking+pooling to avoid truncation.
-
-    pooling: 'mean' or 'length' (token-length-weighted mean)
-    """
-    df = pd.read_csv(filename).dropna(subset=[col_name])
-
-    if tokenizer is None:
-        # Try to infer tokenizer from model
-        tokenizer = _get_tokenizer(model)
-
-    # Ensure SentenceTransformer won't pre-truncate too aggressively
-    # (underlying HF model usually caps at 512 anyway)
-    try:
-        model.max_seq_length = max(model.max_seq_length, max_tokens)
-    except Exception:
-        pass
-
-    # Vectorize row-wise (handles long texts)
-    embs = []
-    truncated_count = 0
-    for txt in df[col_name].astype(str).tolist():
-        tok_count = count_tokens(txt, tokenizer)
-        if tok_count > max_tokens:
-            truncated_count += 1
-            v = embed_long_text(model, tokenizer, txt,
-                                max_tokens=max_tokens,
-                                overlap_tokens=overlap_tokens,
-                                pooling=pooling)
-        else:
-            v = model.encode([txt], convert_to_numpy=True)[0]
-        embs.append(v)
-
-    if warn_on_truncation and truncated_count > 0:
-        print(f"⚠️  {truncated_count} / {len(df)} texts exceeded {max_tokens} tokens "
-              f"and were chunked (no truncation).")
-
-    df["embedding"] = embs
+    df = df.dropna(subset=[col_name])
+    print("🧬embedding column...")
+    df["embedding"] = list(model.encode(df[col_name],batch_size=2048))
     return df
 
 
+from tqdm import tqdm
+from sentence_transformers import util
 
 def item_level_ccr(data_encoded_df, questionnaire_encoded_df):
-    """Compute cosine similarities between data and questionnaire embeddings."""
+    print("🔍 Computing cosine similarities between data and questionnaire embeddings...")
+
     q_embeddings = questionnaire_encoded_df.embedding
     d_embeddings = data_encoded_df.embedding
+
     similarities = util.pytorch_cos_sim(d_embeddings, q_embeddings)
-    for i in tqdm(range(1, len(questionnaire_encoded_df) + 1), desc="Computing sim_item_X"):
+
+    print("📊 Populating similarity scores into DataFrame...")
+
+    for i in tqdm(range(1, len(questionnaire_encoded_df) + 1), desc="Computing sim_item_X columns"):
         data_encoded_df[f"sim_item_{i}"] = similarities[:, i - 1]
+
+    print("✅ Similarity computation complete.")
     return data_encoded_df
 
 
-def ccr_wrapper(data_file, data_col, q_file, q_col,
-                model='all-MiniLM-L6-v2',
-                max_tokens=384,          # <= you can raise to 512 for MiniLM; or 1024+ for longer-context models
-                overlap_tokens=32,
-                pooling='mean',
-                device='cuda'):
+
+def ccr_wrapper(data_file, data_col, q_file, q_col, model='all-MiniLM-L6-v2'):
     """
-    Run full CCR pipeline with token-aware chunking for long texts.
+    Returns a Dataframe that is the content of data_file with one additional column for CCR value per question
 
-    Parameters
-    ----------
-    model : str | SentenceTransformer
-        Name or instance. Swap to a long-context embedding model if available.
-    max_tokens : int
-        Token budget per chunk (<= model's real max, commonly 512 for SBERTs).
-    overlap_tokens : int
-        Sliding-window overlap (token-level, approximate).
-    pooling : str
-        'mean' or 'length' (length-weighted mean across chunks)
-    device : str
-        'cuda' or 'cpu'
+    Parameters:
+        data_file (str): path to the file containing user text
+        data_col (str): column that includes user text
+        q_file (str): path to the file containing questionnaires
+        q_col (str): column that includes questions
+        model (str): name of the SBERT model to use for CCR see https://www.sbert.net/docs/pretrained_models.html for full list
+
     """
-    # Build/normalize model
-    if isinstance(model, str):
-        try:
-            model = SentenceTransformer(model, device=device).to(device)
-        except Exception:
-            model = SentenceTransformer('all-MiniLM-L6-v2', device=device).to(device)
+    print("hola mundo")
+    try:
+        model = SentenceTransformer(model, device="cuda").to('cuda')
+        print("model successfully mounted on cuda⚡")
+    except:
+        model = SentenceTransformer('all-MiniLM-L6-v2', device="cuda").to('cuda')
+        print("model successfully mounted on cuda⚡")
+    questionnaire_filename = q_file
+    data_filename = data_file
 
-    tokenizer = _get_tokenizer(model)
+    q_encoded_df = encode_column(model, questionnaire_filename, q_col)
+    data_encoded_df = encode_column(model, data_filename, data_col)
 
-    # Encode questionnaire items (almost always short; no need to chunk)
-    q_encoded_df = encode_column(model, q_file, q_col,
-                                 tokenizer=tokenizer,
-                                 max_tokens=max_tokens,
-                                 overlap_tokens=overlap_tokens,
-                                 pooling=pooling,
-                                 warn_on_truncation=False)
+    ccr_df = item_level_ccr(data_encoded_df, q_encoded_df)
+    # ccr_df = ccr_df.drop(columns=["embeddings"])
 
-    # Encode data (may be long; token-aware)
-    d_encoded_df = encode_column(model, data_file, data_col,
-                                 tokenizer=tokenizer,
-                                 max_tokens=max_tokens,
-                                 overlap_tokens=overlap_tokens,
-                                 pooling=pooling,
-                                 warn_on_truncation=True)
-
-    return item_level_ccr(d_encoded_df, q_encoded_df)
-
-
+    # ccr_df.to_csv("ccr_results.csv")
+    return ccr_df
 
 def load_glove(path, vocab, embed_size=300):
-    """Load GloVe vectors for vocab."""
     E = dict()
     vocab = set(vocab)
-    found = []
+    found = list()
     with open(path) as fo:
         for line in fo:
             tokens = line.strip().split()
-            vec = tokens[-embed_size:]
-            token = "".join(tokens[:-embed_size])
+            vec = tokens[len(tokens) - embed_size:]
+            token = "".join(tokens[:len(tokens) - embed_size])
             E[token] = np.array(vec, dtype=np.float32)
             if token in vocab:
                 found.append(token)
-    if vocab:
-        print(f"Found {len(found)}/{len(vocab)} tokens in {path}")
+    if vocab is not None:
+        print("Found {}/{} tokens in {}".format(len(found),
+                                len(vocab), path))
     return E, embed_size
 
-
-def _avg_vecs(words, E, embed_size=300, max_size=None, min_size=1, sampling=False, sampling_k=4):
-    vecs = []
+def _avg_vecs(words, E, embed_size=300, max_size=None, min_size=1, sampling=False, sampling_k=4, verbose=False):
+    vecs = list()
     if sampling:
-        words = random.sample(words, min(len(words), sampling_k))
-    for w in words:
-        if w in E:
+        if len(words)>sampling_k:
+            words = random.sample(words, sampling_k)
+        else:
+            print("ignored sampling for ", words)
+        # print(words)
+        for w in words:
             vecs.append(E[w])
-        if max_size and len(vecs) >= max_size:
-            break
+
+    else:
+        for w in words:
+            if w in E:
+                vecs.append(E[w])
+            if max_size is not None:
+                if len(vecs) >= max_size:
+                    break
+    print(len(vecs))
+    # print(words, len(vecs))
     if len(vecs) < min_size:
-        return np.full((embed_size,), np.nan)
+        empty_array = np.empty((embed_size,))
+        empty_array[:] = np.NaN
+        return empty_array
     return np.array(vecs).mean(axis=0)
 
-
 remove = re.compile(r"(?:http(s)?[^\s]+|(pic\.[^s]+)|@[\s]+)")
-alpha = re.compile(r"(?:[a-zA-Z']{2,15}|[aAiI])")
+alpha = re.compile(r'(?:[a-zA-Z\']{2,15}|[aAiI])')
 printable = set(string.printable)
 
 
-def tokenize(t):
-    """Tokenize text into alphabetic tokens."""
+def tokenize(t, stem=False):
     t = remove.sub('', t)
     t = "".join([a for a in filter(lambda x: x in printable, t)])
-    return alpha.findall(t)
-
+    tokens = alpha.findall(t)
+    return tokens
 
 def read_dic_file(f):
-    """Read dictionary .dic format file -> {category: words}."""
-    categories, words = {}, []
+    categories = dict()
+    words = list()
     with open(f, 'r') as fo:
         for line in fo:
-            if not line.strip() or line.startswith("%"):
+            if line.strip() == '':
                 continue
-            parts = line.split()
-            if parts[0].isnumeric() and len(parts) == 2:
-                categories[int(parts[0])] = parts[1]
+            if line.startswith("%"):
+                continue
+            line_split = line.split()
+            # print(line_split)
+            if line_split[0].isnumeric() and len(line_split) == 2:
+
+                cat_id, category = line.split()
+                categories[int(cat_id)] = category
             else:
-                words.append(parts)
-    dictionary = {cat: [] for cat in categories.values()}
+                words.append(line_split)
+    dictionary = {category: list() for id_, category in categories.items()}
     for line in words:
-        word = line[0]
+        # print(line)
+        word = line[000]
         if line[1][0].isalpha():
-            continue
+            continue  # multi word expression
         for cat_id in line[1:]:
             dictionary[categories[int(cat_id)]].append(word)
+
     return dictionary
 
 
 def __load_dictionary(dic_file_path):
-    """Load .dic file -> regex matchers."""
+    # loads words and stems, builds regx: words are put in regx as they are, stems are handled by allowing any char to follow
     d_name = ntpath.basename(dic_file_path).split('.')[0]
     loaded = read_dic_file(dic_file_path)
-    words, stems = {}, {}
+    words, stems = dict(), dict()
     for cat in loaded:
-        words[cat], stems[cat] = [], []
+        words[cat] = list()
+        stems[cat] = list()
         for word in loaded[cat]:
             if word.endswith('*'):
-                stems[cat].append(word[:-1])
+                stems[cat].append(word.replace('*', ''))
             else:
                 words[cat].append(word)
-    rgxs = {}
+    rgxs = dict()
     for cat in loaded:
-        name = f"{d_name}.{cat}"
-        if stems[cat]:
-            regex_str = rf"(?:\b(?:{'|'.join(words[cat])})\b|\b(?:{'|'.join(stems[cat])})[a-zA-Z]*\b)"
+        name = "{}.{}".format(d_name,cat)
+        if len(stems[cat]) == 0:
+            regex_str = r'\b(?:{})\b'.format("|".join(words[cat]))
         else:
-            regex_str = rf"\b(?:{'|'.join(words[cat])})\b"
+            unformatted = r'(?:\b(?:{})\b|\b(?:{})[a-zA-Z]*\b)'
+            regex_str = unformatted.format("|".join(words[cat]),
+                    "|".join(stems[cat]))
         rgxs[name] = re.compile(regex_str)
     return rgxs, words, stems
 
-
 def filter_by_embedding_vocab(E, words):
-    return [w for w in words if w in E], [w for w in words if w not in E]
+    filtered_words = []
+    oov_words = []
+    for word in words:
+        if word in E:
+            filtered_words.append(word)
+        else:
+            oov_words.append(word)
+    return filtered_words, oov_words
 
-
-def _dictionary_centers(d_path, d_name, E, vec_size, max_size=25, sampling=False, sampling_k=4):
+def _dictionary_centers( d_path, d_name, E, vec_size, max_size=25, sampling=False, sampling_k=4, verbose=False):
     _, d_words, _ = __load_dictionary(d_path)
+
+
+    #filtering the oov words:
+    oov_words = {}
     for cat in d_words:
-        d_words[cat], _ = filter_by_embedding_vocab(E, d_words[cat])
-    names, vecs = [], []
-    for cat in d_words:
-        v = _avg_vecs(d_words[cat], E, vec_size, max_size=max_size, sampling=sampling, sampling_k=sampling_k)
-        vecs.append(v)
-        names.append(f"{d_name}.ddr.{cat}")
+        d_words[cat], oov_words[cat] = filter_by_embedding_vocab(E, d_words[cat])
+
+    # vocab = list(set([w for cat in d_words for w in d_words[cat]]))
+    # path = PRETRAINED[vec_name]
+    # E, vec_size = load_glove(path, vocab)
+
+    names = list()
+    vecs = list()
+    # print(d_words)
+    for category in d_words:
+        to_append_vecs = _avg_vecs(d_words[category],
+                E, embed_size=vec_size, max_size=max_size, sampling=sampling, sampling_k=sampling_k, verbose=verbose)
+        vecs.append(to_append_vecs)
+        names.append("{}.ddr.{}".format(d_name, category))
+        # print(category, to_append_vecs, len(to_append_vecs))
     return np.array(vecs, dtype=np.float32), names
 
-
 def count(dic_file_path, ccr_df):
-    """Apply dictionary regex counts to text column 'text'."""
+
+    vectors = list()
+    names = list()
     rgxs, _, _ = __load_dictionary(dic_file_path)
-    for cat, regex in rgxs.items():
+    # print(rgxs.keys())
+    # print(rgxs["other_questionnairs.BE"])
+    # print("00000"*20)
+    # print(rgxs)
+    for cat in rgxs:
+        #     print(cat, rgxs[cat])
         try:
-            bow = CountVectorizer(token_pattern=regex).fit(ccr_df.text.values)
-            X = bow.transform(ccr_df.text.values).sum(axis=1)
-            ccr_df[f"{cat}.count"] = np.squeeze(np.asarray(X))
+            bow = CountVectorizer(token_pattern=rgxs[cat]) \
+                .fit(ccr_df.text.values)
         except:
-            ccr_df[f"{cat}.count"] = 0
+            ccr_df["{}.count.{}".format(cat[:cat.find('.')], cat[cat.find('.') + 1:])] = 0
+            print("missed", cat)
+            continue
+        # vocab = bow.get_feature_names()
+        X = bow.transform(ccr_df.text.values).sum(axis=1)
+        ccr_df["{}.count.{}".format(cat[:cat.find('.')], cat[cat.find('.') + 1:])] = np.squeeze(np.asarray(X))
+
     return ccr_df
 
-
 def csv_to_dic(csv_dic_path, result_path):
-    """Convert CSV of wordlists -> .dic format file."""
-    df = pd.read_csv(csv_dic_path)
-    with open(result_path, "w") as fo:
-        fo.write("%\n")
-        for i, col in enumerate(df.columns, start=1):
-            fo.write(f"{i}\t{col}\n")
-        fo.write("%\n")
-        for i, col in enumerate(df.columns, start=1):
-            for word in df[col].dropna():
-                fo.write(f"{word}\t{i}\n")
+    textfile = open(result_path, "w")
+    textfile.write("% \n")
+    dic_df = pd.read_csv(csv_dic_path)
+    for i, col in enumerate(dic_df.columns):
+        textfile.write(str(i + 1) + "\t" + col + " \n")
+
+    textfile.write("% \n")
+
+    for i, col in enumerate(dic_df.columns):
+        for word in dic_df[col].dropna():
+            textfile.write(word + " \t " + str(i + 1) + " \n")
+    textfile.close()
+
+
+def _ensure_1based_sim_cols(n):
+    """Return the list of per-item sim column names in the 1..n scheme you already use."""
+    return [f"sim_item_{i}" for i in range(1, n + 1)]
+
+def add_title_scores(sim_df: pd.DataFrame, questionnaire_df: pd.DataFrame, title_col: str = "title") -> pd.DataFrame:
+    """
+    Given:
+      - sim_df: output of item_level_ccr (has sim_item_1..sim_item_N)
+      - questionnaire_df: the encoded questionnaire rows (M rows), in the SAME order as used to compute sims
+        and containing a 'title' column that names the construct/group for each item.
+    Produces:
+      - new columns sim_<title> that are the (simple) average across that title's items.
+    """
+    q = questionnaire_df.reset_index(drop=True)
+    if title_col not in q.columns:
+        raise ValueError(f"Questionnaire is missing required column '{title_col}'")
+    n_items = len(q)
+    item_cols = _ensure_1based_sim_cols(n_items)
+
+    # Build: title -> list of corresponding sim_item_k columns
+    title_to_cols = {}
+    for i in range(n_items):
+        t = q.at[i, title_col]
+        title_to_cols.setdefault(t, []).append(item_cols[i])
+
+    # Average per title
+    for t, cols in title_to_cols.items():
+        # Simple unweighted mean; replace with .mean(axis=1, skipna=True) if needed
+        sim_df[f"sim_{t}"] = sim_df[cols].mean(axis=1)
+
+    return sim_df
+
+
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer, util
+
+import pandas as pd
+from sentence_transformers import SentenceTransformer, util
+from tqdm import tqdm
+
+def compute_ccr_from_embeddings(
+    embeddings_df: pd.DataFrame,
+    questionnaire_file: str,
+    q_col: str,
+    model: str = "all-MiniLM-L6-v2",
+    title_col: str = "dimension"   # <-- average-by column (e.g., "dimension")
+) -> pd.DataFrame:
+    """
+    Returns `embeddings_df` with one additional column per questionnaire item (sim_item_k),
+    and, if available, per-title averages (sim_<title_col>).
+    """
+    print("starting CCR process...")
+    try:
+        st_model = SentenceTransformer(model, device="cuda").to('cuda')
+        print("model successfully mounted on cuda⚡")
+    except:
+        st_model = SentenceTransformer('all-MiniLM-L6-v2', device="cuda").to('cuda')
+        print("model successfully mounted on cuda⚡")
+
+    # Encode questionnaire items (reuse your helper for consistency)
+    questionnaire_filename = questionnaire_file
+    q_encoded_df = encode_column(st_model, questionnaire_filename, q_col)
+
+    # Item-level similarities (same as your pipeline)
+    print("🔍 Computing cosine similarities between data and questionnaire embeddings...")
+    embeddings_df = item_level_ccr(embeddings_df, q_encoded_df)
+
+    # NEW: auto-aggregate by dimension (if column exists)
+    if title_col in q_encoded_df.columns:
+        embeddings_df = add_title_scores(embeddings_df, q_encoded_df, title_col=title_col)
+        print(f"🧮 Added grouped averages: sim_<{title_col}>")
+    else:
+        print(f"(i) No '{title_col}' column in questionnaire; skipping grouped averages.")
+
+    print("✅ CCR computation complete.")
+    return embeddings_df
+
+
+
