@@ -9,14 +9,14 @@ for CCR (Cosine Similarity–based Cultural Representations).
 ## 1. File Format
 
 Every questionnaire is a **CSV file** with this structure:
-
+```
 question_id,dimension,question  
 HI1,Horizontal Individualism,"I'd rather depend on myself than others."  
 LTO13,Long-Term Orientation,"How important is it for you to save money for the future?"  
 MFQ2,Fairness,"Whether or not some people were treated differently than others"  
 GM1,Growth Mindset,"You have a certain amount of intelligence, and you can’t really do much to change it."  
 TL4,Tight-Loose,"People in this country have a great deal of freedom in how they want to behave in most situations."  
-
+```
 - `question_id`: unique ID (scale abbreviation + item number)  
 - `dimension`: subscale/dimension  
 - `question`: verbatim text  
@@ -31,7 +31,7 @@ Each questionnaire CSV lives in `/questionnaires/`.
 The manifest (`questionnaire_manifest.json`) lists the file, scales, items, and reversed items.
 
 Example:
-
+````
 "triandis_indcol": {  
   "file": "triandis_indcol.csv",  
   "scales": {  
@@ -39,19 +39,19 @@ Example:
     "Vertical Individualism": {"item_ids": ["VI1","VI2"], "reverse": []}  
   }  
 }
-
+````
 ---
 
 ## 3. Encoding Process
 
 ### Command Line
-
+````
 python batch_encode_questionnaires.py \  
   --texts /path/to/narratives.csv \  
   --text-col clean_text \  
   --outdir encoded_outputs \  
   --device cuda  
-
+````
 - `--texts`: CSV with narratives  
 - `--text-col`: text column name  
 - `--outdir`: save directory  
@@ -60,7 +60,7 @@ python batch_encode_questionnaires.py \
 Outputs: one Parquet per questionnaire (`item_text`, `embedding`).
 
 ### Python Interactive
-
+```
 from ccr_helpers import ccr_wrapper  
 
 ccr_df = ccr_wrapper(  
@@ -69,17 +69,17 @@ ccr_df = ccr_wrapper(
     q_file="questionnaires/triandis_indcol.csv",  
     q_col="question"  
 )
-
+```
 ---
 
 ## 4. Working with Results
 
 - Narratives get `sim_item_k` columns (cosine similarities).  
 - Build scales with `narratives_helpers.py`:  
-
+```
 from narratives_helpers import make_scale_from_items  
 ccr_df = make_scale_from_items(ccr_df, item_indices=[1,3,7], new_col="Fairness_score")  
-
+```
 - Reverse scoring = multiply by –1 or mark in manifest.  
 - Aggregate to country-level means.
 
@@ -96,15 +96,9 @@ ccr_df = make_scale_from_items(ccr_df, item_indices=[1,3,7], new_col="Fairness_s
 
 ## 6. Recommended Prompt for LLM Agent
 
-You are an assistant helping me run CCR encoding for questionnaires.  
-Steps:  
-1. Load narratives CSV and questionnaire CSV (question_id, dimension, question).  
-2. Encode both with SentenceTransformers.  
-3. Compute cosine similarity (narratives × items).  
-4. Append sim_item_k columns.  
-5. Use manifest to build scale scores (handle reverse items).  
-6. Save full CCR results + tidy scale scores.  
-7. Aggregate scale means by country.  
+```
+in progress. have a good prompt? please contact and contribute your own!
+```
 
 ---
 
