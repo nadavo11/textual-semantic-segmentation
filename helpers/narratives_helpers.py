@@ -18,44 +18,6 @@ import matplotlib.pyplot as plt
 from scipy.stats import linregress
 
 
-def plot_narrative_prevalence(df, min_samples=100):
-    # Define narrative element columns
-    elements = ["causal_sequence", "characters", "internal_states", "plot_structure", "normative_point"]
-    value_cols = [f"{el}_value" for el in elements]
-
-    # Drop rows with missing country or any narrative element
-    df = df.dropna(subset=["country_code"] + value_cols)
-    df["country_code"] = df["country_code"].astype(str)
-
-    # Add a flag: does this row have all 5 narrative elements?
-    df["has_all_5"] = df[value_cols].sum(axis=1) == 5
-
-    # Count total and 'narrative' per country
-    country_counts = df["country_code"].value_counts()
-    eligible_countries = country_counts[country_counts >= min_samples].index
-
-    df_filtered = df[df["country_code"].isin(eligible_countries)]
-
-    total_counts = df_filtered["country_code"].value_counts()
-    narrative_counts = df_filtered[df_filtered["has_all_5"]]["country_code"].value_counts()
-
-    # Compute percentage
-    prevalence_pct = (narrative_counts / total_counts.loc[narrative_counts.index]) * 100
-    prevalence_pct = prevalence_pct.sort_values(ascending=False)
-
-    # Plot
-    plt.figure(figsize=(10, 5))
-    prevalence_pct.plot(kind="bar", color="purple")
-    plt.ylabel("Percentage of Texts with All 5 Narrative Elements")
-    plt.xlabel("Country Code")
-    plt.title(f"Narrative Prevalence by Country (min {min_samples} samples)")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-    plt.show()
-
-    return prevalence_pct
-
-
 # ---------------------------------------------------------------------------
 # 1) EXACT function as requested: plot_narrative_vs_trust
 # ---------------------------------------------------------------------------
@@ -412,13 +374,232 @@ def countrywise_regression(
         plt.tight_layout()
         plt.show()
 
-    return reg_table
+    return reg_table, merged
 
+
+def get_country_score(df, construct_col ):
+    # df is your DataFrame
+    # Step 1: pick the relevant construct column (e.g., "Long-Term Orientation")
+        
+    # Step 2: aggregate by country_code
+    country_scores = (df.groupby("country_code", as_index=False)[construct_col]
+          .mean() 
+          .rename(columns={construct_col: construct_col}))
+
+    print(country_scores.head())
+    return country_scores
 
 __all__ = [
-  "plot_narrative_prevalence",
     "plot_narrative_vs_trust",
     "prevalence_vs_metrics",
     "countrywise_regression",
-
 ]
+
+
+import plotly.express as px
+import pycountry
+
+def plot_country_scores(country_scores: pd.DataFrame,
+                        country_col: str = "country_code",
+                        score_col: str = "score",
+                        title: str = "Country-level CCR score"):
+    """
+    Plot an interactive world choropleth of country-level scores.
+
+    Parameters
+    ----------
+    country_scores : pd.DataFrame
+        Must contain a column with ISO-2 or ISO-3 country codes and a numeric score column.
+    country_col : str
+        Name of the column containing country codes (default: 'country_code').
+    score_col : str
+        Name of the column containing numeric scores (default: 'score').
+    title : str
+        Title for the plot.
+    """
+    # Ensure ISO-3 codes
+    def to_iso3(code):
+        if pd.isna(code): return None
+        code = str(code).upper()
+        if len(code) == 2:  # ISO-2
+            try:
+                return pycountry.countries.get(alpha_2=code).alpha_3
+            except:
+                return None
+        if len(code) == 3:
+            return code
+        return None
+
+    df = country_scores.copy()
+    df["iso3"] = df[country_col].apply(to_iso3)
+
+    fig = px.choropleth(
+        df.dropna(subset=["iso3"]),
+        locations="iso3",
+        color=score_col,
+        hover_name=country_col,
+        color_continuous_scale="Viridis",
+        projection="natural earth",
+        title=title
+    )
+    fig.update_layout(coloraxis_colorbar=dict(title=score_col))
+    fig.show()
+
+
+import pandas as pd
+import numpy as np
+from typing import Iterable, Tuple
+
+def compute_country_prevalence(
+    df_narratives: pd.DataFrame,
+    *,
+    left_country_col: str = "country_code",
+    element_value_suffix: str = "_value",
+    elements: Iterable[str] = ("causal_sequence", "characters", "internal_states", "plot_structure", "normative_point"),
+    require_all: bool = True,     # if False, uses min_elements
+    min_elements: int = 5,        # threshold if require_all=False
+    min_samples: int = 30        # filter: only countries with >= this many rows
+) -> pd.DataFrame:
+    """
+    Compute narrative prevalence per country.
+
+    Prevalence definition:
+      - If require_all=True: % of texts that have ALL elements present.
+      - Else: % of texts that have at least `min_elements` present.
+
+    Returns
+    -------
+    prevalence_df : pd.DataFrame with columns:
+        [left_country_col, 'n', 'with_pattern', 'narrative_prevalence']
+      where 'narrative_prevalence' is in percent (0..100).
+    """
+    df = df_narratives.copy()
+    df[left_country_col] = df[left_country_col].str.upper()
+
+    value_cols = [f"{e}{element_value_suffix}" for e in elements]
+    needed = [left_country_col] + value_cols
+    df = df.dropna(subset=needed)
+
+    # sample size filter
+    eligible = df[left_country_col].value_counts()
+    keep_countries = eligible[eligible >= min_samples].index
+    df = df[df[left_country_col].isin(keep_countries)]
+
+    if df.empty:
+        return pd.DataFrame(columns=[left_country_col, "n", "with_pattern", "narrative_prevalence"])
+
+    # prevalence condition
+    counts_present = df[value_cols].sum(axis=1)
+    if require_all:
+        has_pattern = (counts_present == len(value_cols))
+    else:
+        has_pattern = (counts_present >= min_elements)
+
+    df = df.assign(__has_pattern=has_pattern)
+
+    # totals and with-pattern counts
+    totals = df[left_country_col].value_counts().sort_index()
+    with_pattern = df[df["__has_pattern"]][left_country_col].value_counts().reindex(totals.index).fillna(0.0)
+
+    prevalence = (with_pattern / totals * 100.0)
+
+    prevalence_df = pd.DataFrame({
+        left_country_col: totals.index,
+        "n": totals.values.astype(int),
+        "with_pattern": with_pattern.values.astype(int),
+        "narrative_prevalence": prevalence.values.astype(float)
+    })
+
+    return prevalence_df
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import linregress
+
+def regress_country_scores(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    score_col: str,
+    right_metric: str,
+    left_country_col: str = "country_code",
+    right_country_col: str = "country",
+    annotate: bool = True,
+    figsize=(6.5, 4.5)
+) -> pd.DataFrame:
+    """
+    Merge left_df (with CCR country scores) and right_df (with external metrics),
+    run regression, plot scatter with regression line, and return regression summary.
+
+    Parameters
+    ----------
+    left_df : DataFrame
+        Contains country-level scores, including [left_country_col, score_col].
+    right_df : DataFrame
+        Contains external metrics, including [right_country_col, right_metric].
+    score_col : str
+        Column name in left_df with CCR country scores (e.g. 'Long-Term Orientation').
+    right_metric : str
+        Column name in right_df with the metric to regress on (e.g. 'GDP').
+    left_country_col : str
+        Country identifier in left_df (default 'country_code').
+    right_country_col : str
+        Country identifier in right_df (default 'country').
+    annotate : bool
+        Whether to annotate points with country codes on the scatter plot.
+    figsize : tuple
+        Size of the plot.
+
+    Returns
+    -------
+    pd.DataFrame
+        One-row regression summary with slope, intercept, r, r², p, stderr, means/stds.
+    """
+    # Merge
+    merged = left_df.merge(right_df, left_on=left_country_col, right_on=right_country_col, how="inner").dropna(
+        subset=[score_col, right_metric]
+    )
+    if merged.empty:
+        raise ValueError("No overlap between country sets or missing values.")
+
+    x = merged[score_col].to_numpy()
+    y = merged[right_metric].to_numpy()
+
+    lr = linregress(x, y)
+
+    # --- Plot ---
+    plt.figure(figsize=figsize)
+    sns.scatterplot(x=x, y=y)
+    line_x = pd.Series(np.linspace(x.min(), x.max(), 200))
+    plt.plot(line_x, lr.slope * line_x + lr.intercept, linestyle="--", color="red", label="Linear Fit")
+
+    if annotate:
+        for _, r in merged.iterrows():
+            plt.text(r[score_col] + 0.2, r[right_metric], r[left_country_col], fontsize=8)
+
+    plt.title(f"{score_col} vs {right_metric}")
+    plt.xlabel(score_col)
+    plt.ylabel(right_metric)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Regression table ---
+    reg_row = {
+        "x_var": score_col,
+        "y_var": right_metric,
+        "N": len(merged),
+        "slope": lr.slope,
+        "intercept": lr.intercept,
+        "r": lr.rvalue,
+        "r2": lr.rvalue**2,
+        "p": lr.pvalue,
+        "stderr": lr.stderr,
+        "x_mean": float(x.mean()),
+        "y_mean": float(y.mean()),
+        "x_std": float(x.std(ddof=1)),
+        "y_std": float(y.std(ddof=1)),
+    }
+    return pd.DataFrame([reg_row])
+
